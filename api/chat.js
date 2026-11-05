@@ -1,15 +1,31 @@
 // ============================================================
-// api/chat.js  —  CCS Help Desk Bot · server function (BACKUP COPY)
+// api/chat.js  —  CCS Help Desk Bot · server function
 // ------------------------------------------------------------
 // This file runs on VERCEL'S SERVER, never in the student's browser.
 // That is why it is safe for it to read the secret API key.
 // The browser (index.html) only ever talks to THIS file at /api/chat.
+//
+// NEW: model fallback. If one Gemini model is rate limited (429) or
+// overloaded, we automatically try the next model in the chain.
 // ============================================================
 
-// Which Gemini model to use. We read it from an environment variable
-// so the instructor can switch models in Vercel without editing code.
-// If no variable is set, we fall back to a free-tier Flash-Lite model.
-const MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+// Primary model first, then fallbacks tried in order when the one before it is busy.
+// The instructor can change either in Vercel without editing code:
+//   GEMINI_MODEL=gemini-3.1-flash-lite
+//   GEMINI_FALLBACK_MODELS=gemini-2.5-flash-lite,gemini-2.5-flash
+const PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-3.1-flash-lite";
+const FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || "gemini-2.5-flash-lite,gemini-2.5-flash")
+  .split(",")
+  .map(function (s) { return s.trim(); })
+  .filter(Boolean);
+
+// Remove duplicates so we never try the same model twice.
+const MODEL_CHAIN = [PRIMARY_MODEL].concat(FALLBACK_MODELS)
+  .filter(function (m, i, arr) { return arr.indexOf(m) === i; });
+
+// Errors that mean "this model can't help right now, try another one":
+// 429 = quota/rate limit, 500/503 = Google overloaded, 404 = model name not available.
+const RETRY_STATUSES = [429, 500, 503, 404];
 
 // Server-side safety caps (a second wall behind the guards in index.html).
 // Browser guards can be skipped by a clever user; these cannot.
@@ -81,7 +97,7 @@ module.exports = async function handler(req, res) {
 
   // 7) Build the request for Gemini.
   const payload = {
-    contents: contents,                                   // the chat (memory)
+    contents: contents,                                     // the chat (memory)
     generationConfig: { maxOutputTokens: MAX_REPLY_TOKENS } // cap the reply length
   };
   // The system prompt travels separately from the chat, as "systemInstruction".
@@ -89,29 +105,50 @@ module.exports = async function handler(req, res) {
     payload.systemInstruction = { parts: [{ text: system }] };
   }
 
-  // 8) Call Gemini. The key goes in a header, on the server, out of sight.
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + MODEL + ":generateContent";
-  let response;
-  let data;
-  try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json", // we are sending JSON
-        "x-goog-api-key": key               // the secret key (server only!)
-      },
-      body: JSON.stringify(payload)          // turn our object into JSON text
-    });
-    // Read Gemini's answer. If it is not valid JSON, use an empty object.
-    data = await response.json().catch(function () { return {}; });
-  } catch (err) {
-    // Network problem between Vercel and Google.
-    return res.status(502).json({ error: "Could not reach the AI service. Try again." });
+  // 8) Call Gemini, trying each model in the chain until one works.
+  let response = null;
+  let data = {};
+  let usedModel = null;
+  let networkFailed = false;
+
+  for (const model of MODEL_CHAIN) {
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent";
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json", // we are sending JSON
+          "x-goog-api-key": key               // the secret key (server only!)
+        },
+        body: JSON.stringify(payload)          // turn our object into JSON text
+      });
+      // Read Gemini's answer. If it is not valid JSON, use an empty object.
+      data = await response.json().catch(function () { return {}; });
+      networkFailed = false;
+    } catch (err) {
+      // Network problem between Vercel and Google: try the next model.
+      networkFailed = true;
+      continue;
+    }
+
+    usedModel = model;
+
+    // Success, or an error another model will not fix (e.g. 400 bad request): stop here.
+    if (response.ok || RETRY_STATUSES.indexOf(response.status) === -1) {
+      break;
+    }
+
+    // Otherwise log it and loop on to the next model.
+    console.warn("Model " + model + " failed with " + response.status + ", trying next.");
   }
 
-  // 9) Gemini's free tier said "too many requests" → pass 429 back to the browser.
+  // 9) Handle the final outcome.
+  if (networkFailed || !response) {
+    return res.status(502).json({ error: "Could not reach the AI service. Try again." });
+  }
+  // Every model in the chain was rate limited.
   if (response.status === 429) {
-    return res.status(429).json({ error: "The free AI quota is busy. Wait a minute and try again." });
+    return res.status(429).json({ error: "All AI models are busy right now. Wait a minute and try again." });
   }
   // Any other error from Gemini → friendly message (Google's error text never contains our key).
   if (!response.ok) {
@@ -133,14 +170,15 @@ module.exports = async function handler(req, res) {
   // 11) Read the REAL token counts that Gemini reports (used by the Token & Cost Meter).
   const u = data.usageMetadata || {};
   const usage = {
-    input: u.promptTokenCount || 0,                                    // tokens we sent
+    input: u.promptTokenCount || 0,                                     // tokens we sent
     output: (u.candidatesTokenCount || 0) + (u.thoughtsTokenCount || 0) // tokens it wrote (thinking counts too)
   };
 
   // 12) Send the answer back to the browser in the agreed shape: { reply, usage, model }.
+  //     "model" is the one that actually answered (may be a fallback).
   return res.status(200).json({
     reply: reply || "Sorry, I could not answer that. Please try asking another way.",
     usage: usage,
-    model: MODEL
+    model: usedModel
   });
 };
